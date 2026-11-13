@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""conv-stop: remember Claude Code conversations you break off, and resume them later.
+
+Records come from a Claude Code SessionEnd hook (`conv-stop record`), stored as a JSON
+map in ~/.conv-stop. See README.md.
+"""
+
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+STORE = Path(os.environ.get("CONV_STOP_FILE", Path.home() / ".conv-stop"))
+LOCK = STORE.with_name(STORE.name + ".lock")
+SETTINGS = Path(os.environ.get("CONV_STOP_SETTINGS", Path.home() / ".claude" / "settings.json"))
+GUARD = "CONV_STOP_INTERNAL"  # set on the summariser's own claude call, so it is not recorded
+SUMMARY_MODEL = os.environ.get("CONV_STOP_MODEL", "haiku")
+TAIL_MESSAGES = 12  # how much of the end of the conversation the summary looks at
+
+
+# ---------- store ----------
+
+@contextmanager
+def locked_store():
+    """Read-modify-write the store under an exclusive lock."""
+    LOCK.touch(exist_ok=True)
+    with open(LOCK) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = load_store()
+        yield data
+        tmp = STORE.with_name(STORE.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(STORE)
+
+
+def load_store():
+    if not STORE.exists():
+        return {"next_id": 1, "conversations": {}}
+    return json.loads(STORE.read_text())
+
+
+def find(data, short_id):
+    for session_id, conv in data["conversations"].items():
+        if str(conv["id"]) == str(short_id):
+            return session_id, conv
+    return None, None
+
+
+# ---------- transcript ----------
+
+def message_text(entry):
+    content = entry.get("message", {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if b.get("type") == "text")
+    return ""
+
+
+def conversation_tail(transcript_path, n=TAIL_MESSAGES):
+    """Last n user/assistant text messages, oldest first, as (role, text)."""
+    messages = []
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") in ("user", "assistant") and not entry.get("isMeta"):
+                    text = message_text(entry).strip()
+                    if text and not text.startswith("<"):  # skip command/system wrappers
+                        messages.append((entry["type"], text))
+    except OSError:
+        return []
+    return messages[-n:]
+
+
+def first_words(text, n=7):
+    words = text.split()
+    return " ".join(words[:n]) + ("…" if len(words) > n else "")
+
+
+def placeholder_summary(tail):
+    for role, text in reversed(tail):
+        if role == "user":
+            return first_words(text)
+    return "(no messages)"
+
+
+# ---------- commands ----------
+
+def cmd_record():
+    """SessionEnd hook entry point: JSON on stdin."""
+    if os.environ.get(GUARD):
+        return
+    try:
+        hook = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        return
+    session_id = hook.get("session_id")
+    transcript = hook.get("transcript_path", "")
+    cwd = hook.get("cwd") or os.getcwd()
+    if not session_id:
+        return
+    tail = conversation_tail(transcript)
+    if not tail:
+        return  # nothing said: not worth remembering
+    with locked_store() as data:
+        convs = data["conversations"]
+        conv = convs.get(session_id)
+        if conv is None:
+            conv = {"id": data["next_id"]}
+            data["next_id"] += 1
+            convs[session_id] = conv
+        conv.update({
+            "folder": cwd,
+            "command": f"cd {shell_quote(cwd)} && claude --resume {session_id}",
+            "date": datetime.now().isoformat(timespec="seconds"),
+            "summary": placeholder_summary(tail),
+            "transcript": transcript,
+        })
+    # summarise in the background so exiting claude is not held up
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_summarise", session_id],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def cmd_summarise(session_id):
+    data = load_store()
+    conv = data["conversations"].get(session_id)
+    if not conv or not shutil.which("claude"):
+        return
+    tail = conversation_tail(conv.get("transcript", ""))
+    if not tail:
+        return
+    excerpt = "\n\n".join(f"{role.upper()}: {text[:1500]}" for role, text in tail)
+    prompt = (
+        "Summarise what the END of this conversation was about in exactly 7 words. "
+        "Reply with the 7 words only, no punctuation at the end, no quotes.\n\n" + excerpt
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", SUMMARY_MODEL, "--no-session-persistence",
+             "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
+             "--system-prompt", "You write 7-word summaries of conversations. "
+                                "Reply with the summary only."],
+            input=prompt, capture_output=True, text=True, timeout=120,
+            env={**os.environ, GUARD: "1"},
+            cwd=tempfile.gettempdir(),  # keep project CLAUDE.md files out of the call
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    summary = result.stdout.strip().splitlines()[0].strip().strip('"') if result.stdout.strip() else ""
+    if result.returncode != 0 or not summary:
+        return
+    with locked_store() as data:
+        if session_id in data["conversations"]:
+            data["conversations"][session_id]["summary"] = first_words(summary, 9)
+
+
+def cmd_list(show_all=False):
+    convs = list(load_store()["conversations"].values())
+    convs.sort(key=lambda c: c["date"], reverse=True)
+    if not show_all:
+        latest = {}
+        for c in convs:
+            latest.setdefault(c["folder"], c)
+        convs = list(latest.values())
+    if not convs:
+        print("No conversations recorded yet.")
+        return
+    home = str(Path.home())
+    rows = [(str(c["id"]), c["date"].replace("T", " ")[:16],
+             c["folder"].replace(home, "~", 1), c["summary"]) for c in convs]
+    widths = [max(len(r[i]) for r in rows + [("ID", "DATE", "FOLDER", "")]) for i in range(3)]
+    print(f"{'ID':<{widths[0]}}  {'DATE':<{widths[1]}}  {'FOLDER':<{widths[2]}}  SUMMARY")
+    for r in rows:
+        print(f"{r[0]:<{widths[0]}}  {r[1]:<{widths[1]}}  {r[2]:<{widths[2]}}  {r[3]}")
+
+
+def cmd_show(short_id):
+    _, conv = find(load_store(), short_id)
+    if not conv:
+        die(f"no conversation with id {short_id}")
+    for key in ("id", "folder", "date", "summary", "command"):
+        print(f"{key:<8} {conv[key]}")
+
+
+def cmd_delete(short_id):
+    with locked_store() as data:
+        session_id, conv = find(data, short_id)
+        if not conv:
+            die(f"no conversation with id {short_id}")
+        del data["conversations"][session_id]
+    print(f"deleted {short_id}: {conv['summary']}")
+
+
+def cmd_load(short_id):
+    session_id, conv = find(load_store(), short_id)
+    if not conv:
+        die(f"no conversation with id {short_id}")
+    if not os.path.isdir(conv["folder"]):
+        die(f"folder no longer exists: {conv['folder']}")
+    os.chdir(conv["folder"])
+    print(f"resuming {short_id} in {conv['folder']}: {conv['summary']}", file=sys.stderr)
+    os.execvp("claude", ["claude", "--resume", session_id])
+
+
+def cmd_install():
+    """Add the SessionEnd hook to ~/.claude/settings.json (idempotent)."""
+    command = f"{shell_quote(os.path.abspath(__file__))} record"
+    settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    groups = settings.setdefault("hooks", {}).setdefault("SessionEnd", [])
+    for group in groups:
+        for hook in group.get("hooks", []):
+            if "conv-stop" in hook.get("command", "") and hook["command"].endswith(" record"):
+                hook["command"] = command
+                write_settings(settings)
+                print(f"updated existing hook in {SETTINGS}")
+                return
+    groups.append({"hooks": [{"type": "command", "command": command}]})
+    write_settings(settings)
+    print(f"added SessionEnd hook to {SETTINGS}")
+
+
+def cmd_uninstall():
+    if not SETTINGS.exists():
+        return
+    settings = json.loads(SETTINGS.read_text())
+    groups = settings.get("hooks", {}).get("SessionEnd", [])
+    for group in groups:
+        group["hooks"] = [h for h in group.get("hooks", []) if "conv-stop" not in h.get("command", "")]
+    settings["hooks"]["SessionEnd"] = [g for g in groups if g.get("hooks")]
+    if not settings["hooks"]["SessionEnd"]:
+        del settings["hooks"]["SessionEnd"]
+    write_settings(settings)
+    print(f"removed conv-stop hook from {SETTINGS}")
+
+
+# ---------- helpers ----------
+
+def write_settings(settings):
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    if SETTINGS.exists():
+        shutil.copy(SETTINGS, SETTINGS.with_name(SETTINGS.name + ".bak"))
+    SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+
+
+def shell_quote(s):
+    import shlex
+    return shlex.quote(s)
+
+
+def die(message):
+    print(f"conv-stop: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+USAGE = """usage:
+  conv-stop list            latest conversation per folder
+  conv-stop list --all      every recorded conversation
+  conv-stop load <id>       resume conversation <id> in its folder
+  conv-stop show <id>       details, including the claude command
+  conv-stop delete <id>     forget conversation <id>   (alias: rm)
+  conv-stop install         add the SessionEnd hook to ~/.claude/settings.json
+  conv-stop uninstall       remove it"""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd, args = argv[0], argv[1:]
+    needs_id = {"load", "show", "delete", "rm"}
+    if cmd in needs_id and len(args) != 1:
+        die(f"{cmd} needs an id\n{USAGE}")
+    if cmd == "list":
+        cmd_list(show_all="--all" in args)
+    elif cmd == "load":
+        cmd_load(args[0])
+    elif cmd == "show":
+        cmd_show(args[0])
+    elif cmd in ("delete", "rm"):
+        cmd_delete(args[0])
+    elif cmd == "record":
+        cmd_record()
+    elif cmd == "_summarise":
+        cmd_summarise(args[0])
+    elif cmd == "install":
+        cmd_install()
+    elif cmd == "uninstall":
+        cmd_uninstall()
+    else:
+        die(f"unknown command {cmd}\n{USAGE}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
