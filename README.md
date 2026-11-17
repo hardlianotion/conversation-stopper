@@ -25,11 +25,18 @@ $ conv-stop load 4        # cds to ~/projects/ergates/sport and runs claude --re
 ```sh
 git clone git@github.com:hardlianotion/conversation-stopper.git
 cd conversation-stopper
-ln -s "$PWD/conv-stop" ~/.local/bin/conv-stop   # or anywhere on your PATH
-conv-stop install
+./install.sh
 ```
 
-`conv-stop install` adds a `SessionEnd` hook to `~/.claude/settings.json`. It keeps a backup of the file as `settings.json.bak`, and running it again is safe. To remove the hook, run `conv-stop uninstall`.
+or, without cloning:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hardlianotion/conversation-stopper/main/install.sh | sh
+```
+
+`install.sh` copies `conv-stop` to `~/.local/bin` (set `PREFIX` to choose another prefix, e.g. `PREFIX=/usr/local`), so you can delete the clone afterwards. It then runs `conv-stop install`, which adds a `SessionEnd` hook to `~/.claude/settings.json`. That step keeps a backup of the file as `settings.json.bak`. Running `install.sh` again is safe, and it upgrades to the newest version.
+
+To remove both the hook and the installed file, run `./install.sh --uninstall`. Your saved conversations in `~/.conv-stop` are kept. To remove only the hook, run `conv-stop uninstall`.
 
 ## Commands
 
